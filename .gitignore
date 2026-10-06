@@ -1,0 +1,10 @@
+.venv/
+.idea/
+__pycache__/
+page.html
+*.html
+shifts_log.csv
+.env
+wishes.json
+bot.log
+settings.json
