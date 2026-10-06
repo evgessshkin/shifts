@@ -1,0 +1,21 @@
+# systemd service: keeps the bot running on the server and restarts it after
+# crashes or reboots.
+#   sudo cp deploy/shifts-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now shifts-bot
+#   journalctl -u shifts-bot -f        # watch the log
+[Unit]
+Description=Warehouse shifts Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/shifts
+ExecStart=/home/ubuntu/shifts/.venv/bin/python -u bot.py
+# Servers run on UTC; the bot needs local time for weekends and night hours.
+Environment=TZ=Europe/Bratislava
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
