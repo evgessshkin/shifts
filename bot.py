@@ -10,7 +10,8 @@ Telegram bot for warehouse shifts.
   Days you worked are marked too.
 - Weekend reselect (/settings): swaps a booked shift for a better-paid
   weekend or holiday IMPORT shift when the rest-time rule allows only one.
-- /salary estimates brutto, netto and payout for every month you worked.
+- The calendar's salary button estimates brutto and netto for the shifts
+  worked in that month.
 
 Settings are read from a .env file next to this script (or the environment):
     SHIFTS_URL      - address of the page with the shift tables
@@ -27,7 +28,7 @@ Settings are read from a .env file next to this script (or the environment):
     BOOK_ONLY       - auto-book only shifts whose department contains this
                       text (default "IMPORT"; empty = any department).
                       You still get messages about all departments.
-    HOURLY_RATE     - brutto per hour for /salary (default 6.5)
+    HOURLY_RATE     - brutto per hour for the salary estimate (default 6.5)
 
 Run:                 python bot.py
 Test on saved page:  python bot.py saved_page.html
@@ -41,7 +42,6 @@ import random
 import sys
 import time
 from bisect import bisect_right
-from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 import requests
@@ -54,9 +54,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WISHES_FILE = os.path.join(HERE, "wishes.json")
 SETTINGS_FILE = os.path.join(HERE, "settings.json")
 LOG_FILE = os.path.join(HERE, "shifts_log.csv")
-# Real payslip figures, shown next to the estimates in /salary:
-# {"2026-10": {"gross": 500.00, "net": 465.00, "payout": 455.00}}
-PAYSLIPS_FILE = os.path.join(HERE, "payslips.json")
 
 CHECK_EVERY = (120, 240)      # seconds between checks (random in this range)
 FAST_CHECK_EVERY = (60, 120)  # fast mode, switched on/off in /settings
@@ -140,14 +137,6 @@ def best_schedule(items):
 
 def money(x):
     return f"{x:,.2f}".replace(",", " ")
-
-
-def load_payslips():
-    try:
-        with open(PAYSLIPS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
 
 
 class Telegram:
@@ -649,7 +638,8 @@ class Bot:
                         "🟢" if d in open_days else "")
                 row.append((f"{n}{mark}", f"d:{d.isoformat()}"))
             rows.append(row)
-        rows.append([("💶 Salary this month", f"pay:{year}-{month:02d}")])
+        rows.append([(f"💶 Salary for {MONTHS[month]}",
+                      f"pay:{year}-{month:02d}")])
 
         text = ("Tap a day to choose shifts you want.\n"
                 "✅ booked  ☑️ worked  ⭐ wanted  🟢 open shift")
@@ -712,101 +702,48 @@ class Bot:
 
     # ---------- salary ----------
 
-    def shifts_by_month(self):
-        """Worked shifts plus booked ones that are still coming."""
-        months = defaultdict(lambda: {"worked": [], "booked": []})
-        for s in self.past:
-            months[(s["day"].year, s["day"].month)]["worked"].append(s)
-        for s in self.scheduled:
-            if not any(same_shift(s, p) for p in self.past):
-                months[(s["day"].year, s["day"].month)]["booked"].append(s)
-        return months
-
-    @staticmethod
-    def with_payslip(est, real):
-        """Real payslip numbers where known, estimates otherwise."""
-        gross = real.get("gross", est["gross"])
-        net = real.get("net", est["net"])
-        payout = real.get("payout", net - est["lunches"] * sal.LUNCH_PRICE)
-        return {"gross": (gross, "gross" not in real),
-                "net": (net, "net" not in real),
-                "payout": (payout, "payout" not in real and "net" not in real)}
-
-    def salary_overview(self):
-        months = self.shifts_by_month()
-        if not months:
-            return "No shifts yet. Data comes after the first check.", None
-        payslips = load_payslips()
-        lines = ["💶 Salary per month",
-                 "brutto / netto / to your account (after lunch)", ""]
-        year_total = defaultdict(float)
-        keys = sorted(months, reverse=True)
-        for y, m in keys:
-            data = months[(y, m)]
-            est = sal.month_pay(data["worked"] + data["booked"], y)
-            real = payslips.get(f"{y}-{m:02d}", {})
-            vals = self.with_payslip(est, real)
-            year_total[y] += vals["gross"][0]
-            shown = " / ".join(("≈" if approx else "") + money(v)
-                               for v, approx in vals.values())
-            note = ("  📄" if real else "") + (
-                f"  ⏳ {len(data['booked'])} booked" if data["booked"] else "")
-            lines.append(f"{m:02d}.{y} ({est['shifts']}): {shown}{note}")
-        lines.append("")
-        lines += [f"{y} brutto total ≈ {money(v)} €"
-                  for y, v in sorted(year_total.items(), reverse=True)]
-        lines.append("\n📄 = from your payslip, ≈ = estimate.\n"
-                     "Tap a month for details.")
-        text = "\n".join(lines)
-        if len(text) > 4000:                 # Telegram message limit
-            text = text[:3990] + "\n…"
-        buttons = [(f"{m:02d}.{y}", f"pay:{y}-{m:02d}") for y, m in keys]
-        rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
-        return text, rows
-
     def salary_month(self, key):
-        y, m = map(int, key.split("-"))
-        data = self.shifts_by_month().get((y, m), {"worked": [], "booked": []})
-        shifts = data["worked"] + data["booked"]
-        est = sal.month_pay(shifts, y)
-        mh = sal.min_hourly(y)
-        h = est["hours"]
-        planned = sum((lambda a, b: (b - a).total_seconds() / 3600)(
-            *sal.shift_times(s)) for s in shifts)
-        lines = [f"💶 {MONTHS[m]} {y}",
-                 f"Worked: {len(data['worked'])} shifts"
-                 + (f", booked: {len(data['booked'])} more"
-                    if data["booked"] else ""),
-                 f"Planned {planned:.2f} h → paid ≈{h['all']:.2f} h "
-                 f"(minus 30 min break per shift, ×{sal.PAID_FACTOR} for "
-                 f"toilet breaks and clocking)", "",
-                 f"Base {h['all']:.2f} h × {sal.hourly_rate():.2f} = "
-                 f"{money(est['lines']['base'])}"]
-        names = {"sat": "Saturday", "sun": "Sunday", "holiday": "Holiday",
-                 "night": "Night"}
-        for k, name in names.items():
-            if est["lines"][k]:
-                lines.append(f"{name} {h[k]:.2f} h × "
-                             f"{sal.SUPPLEMENT[k] * mh:.2f} = "
-                             f"{money(est['lines'][k])}")
-        lines += [f"Brutto ≈ {money(est['gross'])}",
-                  f"Insurance 4 % + 3 %: −{money(est['insurance'])}",
-                  f"Tax 19 % (first {money(sal.for_year(sal.TAX_FREE, y))} "
-                  f"tax-free): −{money(est['tax'])}",
-                  f"Netto ≈ {money(est['net'])}",
-                  f"Lunch {est['lunches']} × {sal.LUNCH_PRICE:.0f} €: "
-                  f"−{money(est['lunches'] * sal.LUNCH_PRICE)}",
-                  f"To your account ≈ {money(est['payout'])}"]
-        real = load_payslips().get(key)
-        if real:
-            lines.append("\n📄 Payslip: " + ", ".join(
-                f"{label} {money(real[k])}" for k, label in
-                (("gross", "brutto"), ("net", "netto"), ("payout", "to account"))
-                if k in real))
+        """Estimated pay for the shifts worked in one month."""
+        try:
+            y, m = map(int, key.split("-"))
+        except ValueError:      # old "All months" button: show this month
+            y, m = date.today().year, date.today().month
+        worked = [s for s in self.past
+                  if (s["day"].year, s["day"].month) == (y, m)]
+        booked = [s for s in self.scheduled
+                  if (s["day"].year, s["day"].month) == (y, m)
+                  and not any(same_shift(s, p) for p in self.past)]
+        rows = [[("« Back", f"m:{y}-{m}")]]
+        title = f"💶 {MONTHS[m]} {y}"
+        if not worked:
+            return (f"{title}\nNo worked shifts in this month"
+                    + (f" yet ({len(booked)} booked)." if booked else "."),
+                    rows)
+
+        pay = sal.month_pay(worked, y)
+        names = {"weekday": "Weekdays", "sat": "Saturdays",
+                 "sun": "Sundays", "holiday": "Holidays"}
+        lines = [title, f"Worked shifts: {len(worked)}", ""]
+        for t, name in names.items():
+            d = pay["days"][t]
+            if d["shifts"]:
+                n = d["shifts"]
+                lines.append(f"{name}: {money(d['gross'])} € "
+                             f"({n} shift{'s' if n > 1 else ''})")
+        lines += ["",
+                  f"Brutto: {money(pay['gross'])} €",
+                  f"Insurance 4 % + 3 %: −{money(pay['insurance'])}",
+                  f"Tax 19 %: −{money(pay['tax'])}",
+                  f"Netto: {money(pay['net'])} €",
+                  f"Lunch {pay['lunches']} × {sal.LUNCH_PRICE:.0f} €: "
+                  f"−{money(pay['lunches'] * sal.LUNCH_PRICE)}",
+                  f"To your account: {money(pay['payout'])} €"]
+        if booked:
+            lines.append(f"\nNot counted yet: {len(booked)} booked shifts.")
+        lines.append("Estimate: shift time minus 30 min break, "
+                     f"×{sal.PAID_FACTOR} for toilet breaks.")
         if y < 2026:
-            lines.append("\nOlder month: uses your current hourly rate, "
-                         "which may have been different then.")
-        rows = [[("« All months", "pay:all")]]
+            lines.append("Older month: uses your current hourly rate.")
         return "\n".join(lines), rows
 
     def status_text(self):
@@ -848,8 +785,6 @@ class Bot:
             self.tg.send(self.status_text())
         elif text == "/settings":
             self.tg.send(*self.settings_view())
-        elif text == "/salary":
-            self.tg.send(*self.salary_overview())
         elif text == "/check":
             since = (datetime.now() - self.last_check).total_seconds() \
                 if self.last_check else MIN_MANUAL_CHECK
@@ -862,7 +797,6 @@ class Bot:
             self.tg.send("Commands:\n"
                          "/calendar – choose the shifts you want\n"
                          "/wishes – list wanted shifts\n"
-                         "/salary – brutto and netto per month\n"
                          "/status – last check and counts\n"
                          "/settings – auto-booking, reselect, night, fast\n"
                          "/check – check the page now")
@@ -885,9 +819,7 @@ class Bot:
             note = f"{arg}: {'on' if self.settings[arg] else 'off'}"
             self.tg.edit(msg_id, *self.settings_view())
         elif kind == "pay":
-            view = self.salary_overview() if arg == "all" \
-                else self.salary_month(arg)
-            self.tg.edit(msg_id, *view)
+            self.tg.edit(msg_id, *self.salary_month(arg))
         elif kind == "fast":
             self.set_fast(arg == "on")
             note = "Fast checking on" if self.fast else "Normal checking"
@@ -906,7 +838,6 @@ class Bot:
         self.tg.call("setMyCommands", commands=[
             {"command": "calendar", "description": "Choose the shifts you want"},
             {"command": "wishes", "description": "List wanted shifts"},
-            {"command": "salary", "description": "Brutto and netto per month"},
             {"command": "status", "description": "Last check and counts"},
             {"command": "settings",
              "description": "Auto-booking, reselect, night, fast checking"},

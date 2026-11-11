@@ -2,7 +2,7 @@
 Salary estimate for a student work agreement ("dohoda o brigádnickej práci
 študentov") in Slovakia.
 
-Checked against the payslips for 08.2026 and 10.2026:
+Checked against the payslips for 08.2026 and 10.2026 (given the real hours):
     brutto  = paid hours x hourly rate + supplements
               (Saturday 50 %, Sunday 100 %, holiday 100 %, night 40 %
                of the minimum hourly wage = minimum monthly wage / 174)
@@ -135,17 +135,34 @@ def amount(hours, rate):
     return float(exact.quantize(Decimal("0.01"), ROUND_HALF_UP))
 
 
+DAY_TYPES = ("weekday", "sat", "sun", "holiday")
+
+
+def day_type(shift):
+    """Which kind of day a shift is paid as. A holiday on a weekend counts
+    as a holiday, since that supplement is the one paid."""
+    day = shift["day"]
+    if is_holiday(day):
+        return "holiday"
+    return {5: "sat", 6: "sun"}.get(day.weekday(), "weekday")
+
+
 def month_pay(shifts, year):
-    """Payslip-style breakdown for the shifts of one month."""
+    """Brutto per kind of day (supplements included), then netto."""
     mh = min_hourly(year)
-    hours = {k: 0.0 for k in ("all", "sat", "sun", "holiday", "night")}
+    days = {t: {"shifts": 0, "hours": 0.0, "gross": 0.0} for t in DAY_TYPES}
+    hours = {t: {k: 0.0 for k in ("all", *SUPPLEMENT)} for t in DAY_TYPES}
     for s in shifts:
+        t = day_type(s)
+        days[t]["shifts"] += 1
         for k, v in shift_hours(s).items():
-            hours[k] += v
-    lines = {"base": amount(hours["all"], hourly_rate())}
-    for k in SUPPLEMENT:
-        lines[k] = amount(hours[k], SUPPLEMENT[k] * mh)
-    gross = money(sum(lines.values()))
+            hours[t][k] += v
+    for t in DAY_TYPES:
+        h = hours[t]
+        days[t]["hours"] = h["all"]
+        days[t]["gross"] = money(amount(h["all"], hourly_rate()) + sum(
+            amount(h[k], SUPPLEMENT[k] * mh) for k in SUPPLEMENT))
+    gross = money(sum(d["gross"] for d in days.values()))
     insurance = money(money(gross * OLD_AGE, ROUND_DOWN)
                       + money(gross * DISABILITY, ROUND_DOWN))
     taxable = gross - insurance - for_year(TAX_FREE, year)
@@ -153,7 +170,7 @@ def month_pay(shifts, year):
     net = money(gross - insurance - tax)
     lunches = sum(1 for s in shifts if s.get("lunch"))
     return {
-        "shifts": len(shifts), "hours": hours, "lines": lines,
+        "shifts": len(shifts), "days": days,
         "gross": gross, "insurance": insurance, "tax": tax,
         "net": net, "lunches": lunches,
         "payout": money(net - lunches * LUNCH_PRICE),
