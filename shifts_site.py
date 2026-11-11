@@ -2,6 +2,7 @@
 Talking to the shift website: download the page, read the tables, book a shift.
 """
 
+from collections import namedtuple
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -16,6 +17,10 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
 )
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+# invitations: {key: shift}; scheduled and past: lists of shifts.
+Page = namedtuple("Page", "invitations scheduled past csrf")
 
 
 class LoggedOut(Exception):
@@ -35,6 +40,15 @@ def cell_text(row, name):
     return td.get_text(strip=True) if td else "?"
 
 
+def row_times(row):
+    """(from, to) of a row. The site shows one "06:00 - 14:00" column now;
+    older versions had separate time_from / time_to columns."""
+    if row.find("td", attrs={"name": "time"}):
+        start, _, end = cell_text(row, "time").partition("-")
+        return start.strip() or "?", end.strip() or "?"
+    return cell_text(row, "time_from"), cell_text(row, "time_to")
+
+
 def table_rows(soup, table_id):
     table = soup.find("table", id=table_id)
     if not table:
@@ -45,17 +59,25 @@ def table_rows(soup, table_id):
             day = datetime.strptime(cell_text(row, "date"), "%d.%m.%Y").date()
         except ValueError:
             continue
+        time_from, time_to = row_times(row)
+        # Shift Type holds the department, e.g. "IMPORT Letisko WHS, ...".
+        shift_type = row.find("td", attrs={"name": "shift_type"})
+        location = row.find("td", attrs={"name": "location"})
+        # In My Scheduled / My Past Shifts a check mark means lunch ordered.
+        lunch = row.find("td", attrs={"name": "lunch"})
         rows.append((row, {
             "day": day,
-            "time_from": cell_text(row, "time_from"),
-            "time_to": cell_text(row, "time_to"),
-            "responsible": cell_text(row, "user_id"),
+            "time_from": time_from,
+            "time_to": time_to,
+            "place": shift_type.get_text(strip=True) if shift_type else None,
+            "location": location.get_text(strip=True) if location else None,
+            "lunch": bool(lunch and lunch.find("i", class_="fa-check")),
         }))
     return rows
 
 
 def parse_page(html):
-    """Return (invitations, scheduled, csrf_token) from the shift page."""
+    """Read the three tables and the form token from the shift page."""
     soup = BeautifulSoup(html, "html.parser")
 
     invitations = {}
@@ -65,27 +87,35 @@ def parse_page(html):
             s["status"] = "available"
             s["id"] = button.get("data-id")
             s["can_lunch"] = button.get("data-can_lunch") == "True"
-            # data-name is "date / department, address / responsible - you"
-            parts = button.get("data-name", "").split(" / ")
-            s["place"] = parts[1].strip() if len(parts) > 2 else None
+            if not s["place"]:
+                # Older page: no Shift Type column, department only in
+                # data-name = "date / department, address / responsible - you"
+                parts = button.get("data-name", "").split(" / ")
+                s["place"] = parts[1].strip() if len(parts) > 2 else None
         elif row.find("i", class_="fa-ban"):
             s["status"] = "blocked (rest time)"
             s["id"] = None
-            s["place"] = None     # only shown on the Subscribe button
         else:
             s["status"] = "unknown"
             s["id"] = None
-            s["place"] = None
         # A blocked shift and the same shift once it becomes available get
         # different keys, so you are notified again when it opens for you.
-        key = s["id"] or f"{s['day']} {s['time_from']}-{s['time_to']} {s['status']}"
+        key = s["id"] or (f"{s['day']} {s['time_from']}-{s['time_to']} "
+                          f"{s['place']} {s['status']}")
         invitations[key] = s
 
-    scheduled = [s for _, s in table_rows(soup, "scheduled_shifts_table")]
+    scheduled = []
+    for row, s in table_rows(soup, "scheduled_shifts_table"):
+        # No Cancel button when it is too late to unregister.
+        button = row.find("button", class_="cancel_shift")
+        s["cancel_id"] = button.get("data-id") if button else None
+        scheduled.append(s)
+
+    past = [s for _, s in table_rows(soup, "past_shifts_table")]
 
     token_input = soup.find("input", attrs={"name": "csrf_token"})
     csrf = token_input.get("value") if token_input else None
-    return invitations, scheduled, csrf
+    return Page(invitations, scheduled, past, csrf)
 
 
 def describe(s):
@@ -94,6 +124,8 @@ def describe(s):
 
 
 def same_shift(a, b):
+    if a.get("place") and b.get("place") and a["place"] != b["place"]:
+        return False
     return (a["day"], a["time_from"], a["time_to"]) == \
            (b["day"], b["time_from"], b["time_to"])
 
@@ -178,5 +210,15 @@ class Site:
 
         # Check the result the same way you would: reload and look at the table.
         time.sleep(random.uniform(2, 4))
-        _, scheduled, _ = self.fetch()
-        return any(same_shift(shift, s) for s in scheduled)
+        return any(same_shift(shift, s) for s in self.fetch().scheduled)
+
+    def cancel(self, shift, csrf):
+        """Unregister from a booked shift. True if it left My Scheduled Shifts."""
+        r = self.session.post(
+            urljoin(self.url, "/report/cancel"),
+            data={"csrf_token": csrf, "record_id": shift["cancel_id"]},
+            timeout=30,
+        )
+        print(f"Cancel {shift['cancel_id']} -> HTTP {r.status_code}")
+        time.sleep(random.uniform(2, 4))
+        return not any(same_shift(shift, s) for s in self.fetch().scheduled)

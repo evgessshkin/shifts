@@ -3,6 +3,10 @@
 #   sudo cp deploy/shifts-bot.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now shifts-bot
 #   journalctl -u shifts-bot -f        # watch the log
+#   journalctl -u shifts-bot -f            # смотреть лог вживую
+#   sudo systemctl stop shifts-bot         # остановить
+#   sudo systemctl disable shifts-bot      # убрать из автозапуска
+
 [Unit]
 Description=Warehouse shifts Telegram bot
 After=network-online.target
